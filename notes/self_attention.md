@@ -277,7 +277,7 @@ After prefill, the cache holds `K_cache = [kA, kB, kC]` and `V_cache = [vA, vB, 
 ```
 
 > [!tip] Where this lives in the code
-> Prefill is step 0 in `generator.py`: the whole prompt goes in and `attention.py` uses `is_causal=True`. Decode is every later step: 1 token goes in (`num_new_tokens = 1`) and `is_causal=False`.
+> Prefill is step 0 of `StaticBatchGenerator._run_batch` (`generators/static_batch.py`): the whole prompt goes in. Decode is every later step: 1 token per request goes in. Both use the same explicit boolean mask in `attention.py`, built once per forward pass by `build_positions_and_mask` (`padding.py`). In decode the mask is all `True` except for pad columns (see [[Static Batching]]).
 
 For why Diagram 4's row is exactly the last row of the full 4×4 matrix, and why the mask makes this safe across all layers, see sections 5 and 6 of [[KV Cache]].
 

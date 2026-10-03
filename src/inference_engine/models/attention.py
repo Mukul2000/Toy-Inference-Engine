@@ -1,7 +1,9 @@
 from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from einops import rearrange
 
 from inference_engine.config import ModelConfig
 from inference_engine.kv_cache import ContiguousKVCache
@@ -41,52 +43,55 @@ class Attention(nn.Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
+        attn_mask: torch.Tensor,
         rope: RotaryEmbedding,
         kv_cache: Optional[ContiguousKVCache] = None,
     ) -> torch.Tensor:
         """
-        Executes Self-Attention for the incoming tokens `x`.
+        Executes Self-Attention for the incoming tokens `x` of all B requests at once.
+
+        Shapes (B = batch size, T = new tokens per row, S = total columns attended over):
+          - x:         [B, T, hidden_size]
+          - positions: [B, T]        RoPE position of each token within its own request
+          - attn_mask: [B, 1, T, S]  True = may attend (causal, never a pad, never another request)
 
         How shapes differ with vs. without `kv_cache` at Decode Step `t`:
           - WITHOUT `kv_cache` (`kv_cache=None`):
-              Caller must pass the ENTIRE sequence `[0..t]`, so `num_new_tokens = t + 1`.
-              `q`, `k_all`, and `v_all` all have length `t + 1`.
+              Caller must pass the ENTIRE sequence `[0..t]` of every row, so `T = S = t + 1`.
           - WITH `kv_cache`:
-              Caller passes ONLY the 1 newest token `[t]`, so `num_new_tokens = 1`.
-              1. `q`, `k_new`, `v_new` are projected for ONLY that 1 new token (length `1`).
-              2. `kv_cache.update()` saves `k_new, v_new` at `positions=[t]` and returns
-                 `k_all, v_all` containing the full history `[0..t]` (length `t + 1`).
-              3. `q` (length `1`) attends over `k_all, v_all` (length `t + 1`).
+              Caller passes ONLY each row's newest token, so `T = 1`.
+              1. `q`, `k_new`, `v_new` are projected for ONLY that 1 new token per row.
+              2. `kv_cache.update()` saves `k_new, v_new` in the next free column and returns
+                 `k_all, v_all` containing every row's full history (`S = t + 1` columns).
+              3. `q` (1 per row) attends over `k_all, v_all` of its OWN row.
         """
-        num_new_tokens = x.shape[0]
+        # `rearrange` patterns name every axis: b = batch, t = new tokens, s = all keys
+        # attended over (cached + new), heads, d = head_dim.
 
-        # 1. Project ONLY the incoming token(s) into Q, K_new, V_new
-        q = self.q_proj(x).view(num_new_tokens, self.num_q_heads, self.head_dim)
-        k_new = self.k_proj(x).view(num_new_tokens, self.num_kv_heads, self.head_dim)
-        v_new = self.v_proj(x).view(num_new_tokens, self.num_kv_heads, self.head_dim)
+        # 1. Project ONLY the incoming token(s), then split the last dim into heads
+        q = rearrange(self.q_proj(x), "b t (heads d) -> b t heads d", d=self.head_dim)
+        k_new = rearrange(self.k_proj(x), "b t (heads d) -> b t heads d", d=self.head_dim)
+        v_new = rearrange(self.v_proj(x), "b t (heads d) -> b t heads d", d=self.head_dim)
 
-        # 2. Rotate Q and K_new at their true sequence `positions`
+        # 2. Rotate Q and K_new at their true per-request `positions`
         q, k_new = rope(q, k_new, positions)
 
         # 3. Assemble full K_all, V_all history (either from KV Cache or just current tokens)
         if kv_cache is not None:
-            k_all, v_all = kv_cache.update(self.layer_idx, positions, k_new, v_new)
+            k_all, v_all = kv_cache.update(self.layer_idx, k_new, v_new)
         else:
             k_all, v_all = k_new, v_new
 
-        # 4. Scaled Dot-Product Attention: `q` [num_new_tokens] attends to `k_all, v_all` [total_seq_len]
+        # 4. Scaled Dot-Product Attention, separately for each request and head. SDPA wants
+        #    heads before tokens. The explicit mask replaces `is_causal`, which knows nothing
+        #    about pads.
         attn_output = F.scaled_dot_product_attention(
-            q.transpose(0, 1),
-            k_all.transpose(0, 1),
-            v_all.transpose(0, 1),
-            is_causal=(num_new_tokens > 1),
+            rearrange(q, "b t heads d -> b heads t d"),
+            rearrange(k_all, "b s heads d -> b heads s d"),
+            rearrange(v_all, "b s heads d -> b heads s d"),
+            attn_mask=attn_mask,
             enable_gqa=True,
         )
 
-        # 5. Merge heads and project output
-        attn_output = (
-            attn_output.transpose(0, 1)
-            .contiguous()
-            .view(num_new_tokens, self.num_q_heads * self.head_dim)
-        )
-        return self.o_proj(attn_output)
+        # 5. Glue the heads back together, then mix them with W_o
+        return self.o_proj(rearrange(attn_output, "b heads t d -> b t (heads d)"))

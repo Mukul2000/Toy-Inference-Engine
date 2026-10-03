@@ -24,11 +24,14 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         positions: torch.Tensor,
+        attn_mask: torch.Tensor,
         rope: RotaryEmbedding,
         kv_cache: Optional[Any] = None,
     ) -> torch.Tensor:
+        # Only self_attn mixes rows, so only it needs `positions` and `attn_mask`;
+        # the norms and MLP treat every token row independently.
         x = x + self.self_attn(
-            self.input_layernorm(x), positions, rope, kv_cache=kv_cache
+            self.input_layernorm(x), positions, attn_mask, rope, kv_cache=kv_cache
         )
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x

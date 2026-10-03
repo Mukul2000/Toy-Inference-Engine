@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+from einops import rearrange
 
 
 class RotaryEmbedding(nn.Module):
@@ -30,12 +31,13 @@ class RotaryEmbedding(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Args:
-            q: [num_tokens, num_q_heads, head_dim]
-            k: [num_tokens, num_kv_heads, head_dim]
-            positions: [num_tokens] integer position indices
+            q: [B, T, num_q_heads, head_dim]
+            k: [B, T, num_kv_heads, head_dim]
+            positions: [B, T] position of each token within its OWN request
         """
-        cos = self.cos_cached[positions].unsqueeze(1).to(q.dtype)
-        sin = self.sin_cached[positions].unsqueeze(1).to(q.dtype)
+        # Every head of a token gets the same rotation: a heads axis of size 1 broadcasts
+        cos = rearrange(self.cos_cached[positions], "b t d -> b t 1 d").to(q.dtype)
+        sin = rearrange(self.sin_cached[positions], "b t d -> b t 1 d").to(q.dtype)
         q_rot = (q * cos) + (self._rotate_half(q) * sin)
         k_rot = (k * cos) + (self._rotate_half(k) * sin)
         return q_rot, k_rot

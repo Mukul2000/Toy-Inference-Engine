@@ -156,3 +156,82 @@ class GenerationResult:
 3. **Memory Accounting**:
    - Verify that KV cache memory growth per step matches the theoretical formula:
      $$\Delta \text{Bytes} = 2 \times n_{\text{layers}} \times n_{\text{kv\_heads}} \times d_{\text{head}} \times 4 \text{ bytes (FP32)}$$
+
+---
+
+## 5. Milestone 1.5 Design: Static Batching
+
+Background and derivations: [`notes/static_batching.md`](notes/static_batching.md).
+
+### 5.1 Problem Statement & Hypothesis
+- At $B = 1$, every decode step streams all ~540 MB of weights from RAM to do one multiply-add per weight. Running requests in parallel threads does not help: each forward pass pays that cost again.
+- **Hypothesis**: stacking $B$ requests as rows of one tensor turns $B$ matrix-vector products into one matrix-matrix product. Step latency stays roughly flat while $B$ is small, so throughput scales almost linearly with $B$.
+- **Expected costs**: *padding waste* (prompts padded to the longest) and *tail waste* (finished rows hold their slot until the longest row finishes).
+
+### 5.2 Design
+- **Layout**: left-padded `[B, T]`. Every row ends at the same column, so decode moves in lockstep with one shared write column.
+- **Only attention needs batch awareness.** Embeddings, RMSNorm, projections, MLP and `lm_head` work row-wise and need no change.
+
+| Component | Change |
+| :--- | :--- |
+| `padding.py` (new) | `left_pad()` (engine side) and `build_positions_and_mask()` (model side) |
+| `ContiguousKVCache` | buffer `[L, B, S, n_kv, d]`, written by **column** at a single `current_seq_len` |
+| `RotaryEmbedding` | per-request positions `[B, T]` |
+| `Attention` | `[B, T, heads, d]` shapes, explicit boolean `attn_mask` instead of `is_causal` |
+| `TransformerModel` | `forward(input_ids [B,T], pad_lens [B], kv_cache) -> logits [B, V]`, `lm_head` on the last column only |
+| `generators/` (new package) | `Generator` interface (see 5.3). `StaticBatchGenerator` keeps `use_cache`. `NaiveGenerator` is `StaticBatchGenerator` with `max_batch_size = 1` |
+
+**Invariants**:
+1. **Storage column ≠ position**: `position = column − pad_lens[b]`.
+2. **Mask**: a query may attend a key iff (causal **and** key is not a pad) **or** key is the query itself. The last clause is the NaN guard for pad queries.
+3. **Lockstep**: one `current_seq_len` for the whole batch. Finished rows keep computing until all rows finish.
+
+### 5.3 Interfaces
+Every generation strategy implements one interface, so the driver and benchmarks do not change when a strategy is added (Milestone 2 adds `ContinuousBatchGenerator`):
+
+```python
+class Generator(ABC):                                     # generators/base.py
+    @abstractmethod
+    def generate(self, requests: list[Request]) -> GenerationResult: ...
+
+Request(prompt_ids: list[int], max_new_tokens: int)       # request.py
+RequestOutput(token_ids, ttft_ms, latency_ms)             # metrics.py, one per request
+GenerationResult(outputs, total_time_ms, step_metrics)    # metrics.py, one per run
+
+StaticBatchGenerator(model, max_batch_size=8, use_cache=True)
+NaiveGenerator(model, use_cache=True)                     # StaticBatchGenerator, max_batch_size=1
+```
+
+- **Request-level, not batch-level**: callers hand over requests, never batches. How requests are grouped into forward passes is the scheduling policy, the very thing that differs between strategies. Continuous batching has no fixed batch at all.
+- **Per-request `max_new_tokens`**. TTFT and latency are measured from the start of `generate()`, so time spent waiting behind other requests counts.
+- **`abc.ABC`, not `typing.Protocol`**: we own every implementation and want an explicit "is-a" relationship with a shared `__init__`. A subclass that forgets `generate()` fails at construction.
+
+Model side:
+```python
+input_ids, pad_lens = left_pad(prompts, pad_token_id)                # [B, T], [B]
+positions, attn_mask = build_positions_and_mask(pad_lens, start, T)  # [B, T], [B, 1, T, start + T]
+logits = model(input_ids, pad_lens=pad_lens, kv_cache=kv_cache)      # [B, V]
+```
+
+### 5.4 Verification & Acceptance Criteria
+1. **Batched vs. alone parity** (refines NFR2 for batched paths): each request's tokens in the batch equal its tokens when run alone. Bit-identical logits are **not** required: matmul results depend on batch shape (batch invariance), so any divergence must occur at a near-tie (small top-2 logit gap).
+2. **Cache vs. no-cache parity** in batched mode.
+3. **Negative control**: without the pad mask, padded rows must diverge.
+4. **Throughput**: report speedup over serving the same requests one at a time, plus padding and tail waste.
+
+### 5.5 Results
+8 chat requests (prompts 35–56 tokens, up to 32 new tokens), SmolLM2-135M, FP32, CPU:
+
+| | One at a time ($B = 1$) | Static batch ($B = 8$) |
+| :--- | ---: | ---: |
+| Total time | 10,197 ms | 1,845 ms |
+| Throughput | 20.3 tok/s | **112.2 tok/s (5.53×)** |
+| Decode step latency | 48.2 ms (1 row) | 47.9 ms (8 rows) |
+| Avg TTFT | 4,022 ms | 354 ms |
+| Avg request latency | 5,223 ms | 1,549 ms |
+
+- **Latency**: all 8 requests are waiting at $t = 0$ and times are measured from there, so the $B = 1$ numbers include queueing behind earlier requests. With every request present up front, static batching wins on every metric. Its weakness (a request arriving mid-batch waits for the whole batch) needs arrivals over time to show up.
+
+- **Parity**: 8/8 requests token-identical to running alone. Cache matches no-cache, batched and alone. Logits match a Hugging Face left-padded batch within 4.2e-5, with the same argmax.
+- **Negative control**: removing the pad mask shifts padded rows' logits by 0.2–0.9.
+- **Waste**: 26.8% of prefill tokens were pads (5.27 MiB of KV cache). 19.8% of decode row-slots belonged to already-finished requests. These are the baselines for Milestone 2 (continuous batching).
