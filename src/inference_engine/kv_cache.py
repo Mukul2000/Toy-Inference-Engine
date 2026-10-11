@@ -30,13 +30,19 @@ class ContiguousKVCache:
         self.dtype = dtype
         self.current_seq_len = 0
 
+        # It's space set aside before generation starts, not what actually gets used.
         cache_shape = (
-            config.num_hidden_layers,
-            batch_size,
-            max_seq_len,
-            config.num_key_value_heads,
-            config.head_dim,
+            config.num_hidden_layers, # cache for which layer index
+            batch_size, # order of the request in the batch (each request gets its own KV cache) 
+            max_seq_len, # longest prompt in the batch + largest max_new_tokens in the batch
+            config.num_key_value_heads, # number of key/value heads
+            config.head_dim, # dimension of each head
+            # note that the last 2 make up the output width of k_proj / v_proj:
+            # num_kv_heads * head_dim = 3 * 64 = 192 for SmolLM2. Because of GQA that is
+            # smaller than the hidden dimension (9 query heads * 64 = 576).
         )
+        # the last 3 parameters match one request's k_new / v_new ([T, num_kv_heads, head_dim],
+        # the k_proj / v_proj outputs split into heads), with T widened to max_seq_len.
         self.k_cache = torch.zeros(cache_shape, dtype=dtype)
         self.v_cache = torch.zeros(cache_shape, dtype=dtype)
 

@@ -116,7 +116,7 @@ Now, $Q$ and $K$ contain both semantic meaning _and_ relative positional awarene
 
 #### Stage 5: The Matchmaking (Attention Score Calculation)
 
-The relevance scoring step of attention multiplies **every token's query** with **the keys of all tokens**. This produces a score stating how relevant each token $j$ is to token $i$.
+c
 
 $$\text{Raw Scores} = \frac{QK^T}{\sqrt{D}}$$
 
@@ -147,13 +147,31 @@ Each head gets to build its own independent `32 x 32` relationship map without i
 
 In a decoder-only LLM, token $i$ is **only allowed to look at tokens $0 \dots i$**, never at future tokens. Before the softmax, every cell where $j > i$ (the upper triangle) is set to $-\infty$:
 
+> [!info] What are $q_0, q_1, \dots$ and $k_0, k_1, \dots$?
+> They are **rows** of the $Q$ and $K$ matrices from Stage 2, and row $i$ belongs to token $i$. The link to tokens is made in Stage 2: $Q = XW_q$ multiplies each row of $X$ by $W_q$ **independently**, so token $i$'s row of $X$ becomes row $i$ of $Q$ and nothing else. Take a 4-token sentence `"The cat sat down"` (one sentence, one head):
+>
+> ```
+> token     row of X        row of Q          row of K
+> 0 "The"   x0 (512 dims) → q0 = x0·Wq (64)   k0 = x0·Wk (64)
+> 1 "cat"   x1            → q1 = x1·Wq        k1 = x1·Wk
+> 2 "sat"   x2            → q2 = x2·Wq        k2 = x2·Wk
+> 3 "down"  x3            → q3 = x3·Wq        k3 = x3·Wk
+> ```
+>
+> - $q_i$ is token $i$ asking "what am I looking for?"; $k_j$ is token $j$ advertising "what do I contain?". Every token gets **both** a query and a key (and a value).
+> - Cell `[i, j]` of $QK^T$ is the dot product $q_i \cdot k_j$, a single number: how well token $i$'s question matches token $j$'s label. Row $i$ = all of token $i$'s scores against every token.
+> - The worked example at the end of this note uses letters instead of numbers: `qA` = $q_0$ for token `A`, `qB` = $q_1$, and so on.
+> - This 4×4 is the 32×32 table of Stage 5 shrunk to 4 tokens.
+
 ```
-                 k0      k1      k2      k3
-q0 (token 0) [ q0·k0   -inf    -inf    -inf  ]
-q1 (token 1) [ q1·k0   q1·k1   -inf    -inf  ]
-q2 (token 2) [ q2·k0   q2·k1   q2·k2   -inf  ]
-q3 (token 3) [ q3·k0   q3·k1   q3·k2   q3·k3 ]
+                    k0 "The"  k1 "cat"  k2 "sat"  k3 "down"
+q0 "The"  (token 0) [ q0·k0     -inf      -inf      -inf  ]
+q1 "cat"  (token 1) [ q1·k0     q1·k1     -inf      -inf  ]
+q2 "sat"  (token 2) [ q2·k0     q2·k1     q2·k2     -inf  ]
+q3 "down" (token 3) [ q3·k0     q3·k1     q3·k2     q3·k3 ]
 ```
+
+Row 2 reads: "sat" may look at "The", "cat" and itself, but not "down", which comes later.
 
 Then a softmax is applied along each row ($\text{softmax}(-\infty) = 0$), so each row becomes percentages that sum to 1:
 
@@ -244,7 +262,7 @@ The decode row in Stage 5 is exactly the **last row** of the prefill matrix, whi
 ```
 
 > [!info] Diagram 3: Stage 6 (Weighted sum of values)
-> After softmax, each row of $P$ sums to 1. Row $i$ of the output $O$ is a weighted blend of the values of tokens $0 \dots i$ only.
+> After applying softmax to S it becomes P, each row of $P$ sums to 1. Row $i$ of the output $O$ is a weighted blend of the values of tokens $0 \dots i$ only.
 
 ```
      P (3×3)              V (3×d)          O (3×d)
@@ -277,7 +295,7 @@ After prefill, the cache holds `K_cache = [kA, kB, kC]` and `V_cache = [vA, vB, 
 ```
 
 > [!tip] Where this lives in the code
-> Prefill is step 0 of `StaticBatchGenerator._run_batch` (`generators/static_batch.py`): the whole prompt goes in. Decode is every later step: 1 token per request goes in. Both use the same explicit boolean mask in `attention.py`, built once per forward pass by `build_positions_and_mask` (`padding.py`). In decode the mask is all `True` except for pad columns (see [[Static Batching]]).
+> Prefill is step 0 in `generator.py`: the whole prompt goes in and `attention.py` uses `is_causal=True`. Decode is every later step: 1 token goes in (`num_new_tokens = 1`) and `is_causal=False`.
 
 For why Diagram 4's row is exactly the last row of the full 4×4 matrix, and why the mask makes this safe across all layers, see sections 5 and 6 of [[KV Cache]].
 
