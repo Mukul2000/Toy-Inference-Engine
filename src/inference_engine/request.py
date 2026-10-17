@@ -3,7 +3,7 @@ from dataclasses import dataclass
 
 @dataclass
 class Request:
-    """One generation request: the input type of every Generator."""
+    """One generation request: what callers hand to `Engine.add_request()` / `Engine.generate()`."""
 
     prompt_ids: list[int]
     max_new_tokens: int

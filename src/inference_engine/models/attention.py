@@ -6,7 +6,8 @@ import torch.nn.functional as F
 from einops import rearrange
 
 from inference_engine.config import ModelConfig
-from inference_engine.kv_cache import ContiguousKVCache
+from inference_engine.executor.batch_metadata import BatchMetadata
+from inference_engine.executor.kv_cache import ContiguousKVCache
 from inference_engine.models.rope import RotaryEmbedding
 
 
@@ -42,18 +43,17 @@ class Attention(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        attn_mask: torch.Tensor,
+        meta: BatchMetadata,
         rope: RotaryEmbedding,
         kv_cache: Optional[ContiguousKVCache] = None,
     ) -> torch.Tensor:
         """
-        Executes Self-Attention for the incoming tokens `x` of all B requests at once.
+        Executes Self-Attention for the incoming tokens `x` of all B rows at once.
 
-        Shapes (B = batch size, T = new tokens per row, S = total columns attended over):
-          - x:         [B, T, hidden_size]
-          - positions: [B, T]        RoPE position of each token within its own request
-          - attn_mask: [B, 1, T, S]  True = may attend (causal, never a pad, never another request)
+        Shapes (B = rows, T = new tokens per row, S = total columns attended over):
+          - x:              [B, T, hidden_size]
+          - meta.positions: [B, T]        RoPE position (= column in its slot) of each token
+          - meta.attn_mask: [B, 1, T, S]  True = may attend (k_col <= q_col, own slot only)
 
         How shapes differ with vs. without `kv_cache` at Decode Step `t`:
           - WITHOUT `kv_cache` (`kv_cache=None`):
@@ -61,9 +61,9 @@ class Attention(nn.Module):
           - WITH `kv_cache`:
               Caller passes ONLY each row's newest token, so `T = 1`.
               1. `q`, `k_new`, `v_new` are projected for ONLY that 1 new token per row.
-              2. `kv_cache.update()` saves `k_new, v_new` in the next free column and returns
-                 `k_all, v_all` containing every row's full history (`S = t + 1` columns).
-              3. `q` (1 per row) attends over `k_all, v_all` of its OWN row.
+              2. `kv_cache.update()` saves `k_new, v_new` at column `meta.starts[b]` of row b's
+                 slot and returns `k_all, v_all` with every row's history from its own slot.
+              3. `q` (1 per row) attends over `k_all, v_all` of its OWN slot.
         """
         # `rearrange` patterns name every axis: b = batch, t = new tokens, s = all keys
         # attended over (cached + new), heads, d = head_dim.
@@ -74,22 +74,22 @@ class Attention(nn.Module):
         v_new = rearrange(self.v_proj(x), "b t (heads d) -> b t heads d", d=self.head_dim)
 
         # 2. Rotate Q and K_new at their true per-request `positions`
-        q, k_new = rope(q, k_new, positions)
+        q, k_new = rope(q, k_new, meta.positions)
 
         # 3. Assemble full K_all, V_all history (either from KV Cache or just current tokens)
         if kv_cache is not None:
-            k_all, v_all = kv_cache.update(self.layer_idx, k_new, v_new)
+            k_all, v_all = kv_cache.update(self.layer_idx, k_new, v_new, meta.slot_ids, meta.starts)
         else:
             k_all, v_all = k_new, v_new
 
-        # 4. Scaled Dot-Product Attention, separately for each request and head. SDPA wants
-        #    heads before tokens. The explicit mask replaces `is_causal`, which knows nothing
-        #    about pads.
+        # 4. Scaled Dot-Product Attention, separately for each row and head. SDPA wants
+        #    heads before tokens. The explicit mask replaces `is_causal`, which assumes every
+        #    row starts at column 0.
         attn_output = F.scaled_dot_product_attention(
             rearrange(q, "b t heads d -> b heads t d"),
             rearrange(k_all, "b s heads d -> b heads s d"),
             rearrange(v_all, "b s heads d -> b heads s d"),
-            attn_mask=attn_mask,
+            attn_mask=meta.attn_mask,
             enable_gqa=True,
         )
 

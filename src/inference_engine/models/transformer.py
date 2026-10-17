@@ -4,8 +4,8 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM
 
 from inference_engine.config import ModelConfig, DEFAULT_MODEL_NAME
-from inference_engine.kv_cache import ContiguousKVCache
-from inference_engine.padding import build_positions_and_mask
+from inference_engine.executor.batch_metadata import BatchMetadata
+from inference_engine.executor.kv_cache import ContiguousKVCache
 from inference_engine.models.rope import RotaryEmbedding
 from inference_engine.models.decoder_layer import TransformerBlock
 
@@ -59,32 +59,35 @@ class TransformerModel(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        pad_lens: Optional[torch.Tensor] = None,
+        meta: Optional[BatchMetadata] = None,
         kv_cache: Optional[ContiguousKVCache] = None,
     ) -> torch.Tensor:
         """
-        Batched forward pass over B left-padded requests (a single request is just B = 1).
-        Token `positions` and the `attn_mask` are derived automatically from `pad_lens` and
-        `kv_cache.current_seq_len` (0 without a cache), see `inference_engine.padding`.
+        Batched forward pass over B right-padded rows (a single request is just B = 1).
+        `meta` (see `BatchMetadata`) says where each row's tokens sit: its slot in `kv_cache`,
+        its first column, its positions, the attention mask, and which token is its last real one.
+        `meta=None` means fresh, unpadded rows that all start at column 0 (experiments, HF parity).
 
         Dimensions & Meaning of Matrix `x` (B = batch size, T = new tokens per row,
         H = hidden_size (576), V = vocab_size (49152)):
-          - input_ids : [B, T]    -> T new token IDs for each of the B requests (left-padded).
-          - pad_lens  : [B]       -> Number of left pads in each row (None = no padding).
-          - positions : [B, T]    -> Position of each token within its OWN request (column - pad_lens[b]).
-          - x         : [B, T, H] -> One 576-float vector per token. After passing through the
-                                     30 layers, `x[b, i]` holds the hidden representation predicting
-                                     the word that comes AFTER token `i` of request `b`.
-                                     For generation, we only care about the last column (`x[:, -1]`),
-                                     which predicts the word that comes after each entire sequence!
-          - logits    : [B, V]    -> Vocabulary similarity scores for the next token of each request.
+          - input_ids      : [B, T]    -> T new token IDs for each of the B rows (right-padded).
+          - meta.positions : [B, T]    -> Position of each token within its OWN request (= its column in its slot).
+          - x              : [B, T, H] -> One 576-float vector per token. After passing through the
+                                          30 layers, `x[b, i]` holds the hidden representation predicting
+                                          the word that comes AFTER token `i` of request `b`.
+                                          For generation, we only care about each row's last REAL token
+                                          (`x[b, meta.last_idx[b]]`), which predicts the word that comes
+                                          after each entire sequence!
+          - logits         : [B, V]    -> Vocabulary similarity scores for the next token of each request.
         """
         batch_size, num_new_tokens = input_ids.shape
-        if pad_lens is None:
-            pad_lens = torch.zeros(batch_size, dtype=torch.long, device=input_ids.device)
-        start = kv_cache.current_seq_len if kv_cache is not None else 0
-        # Built once here, shared by all 30 layers
-        positions, attn_mask = build_positions_and_mask(pad_lens, start, num_new_tokens)
+        if meta is None:
+            meta = BatchMetadata.build(
+                slot_ids=list(range(batch_size)),
+                starts=[0] * batch_size,
+                lengths=[num_new_tokens] * batch_size,
+            )
+        # `meta` is built once, outside the model, and shared by all 30 layers
 
         # 1. Lookup initial token embeddings: [B, T] -> [B, T, hidden_size]
         # each token is represented by `hidden_size` floating point numbers
@@ -95,10 +98,10 @@ class TransformerModel(nn.Module):
         #    (Each layer adds Attention + MLP updates onto `x` via residual connections: x = x + delta)
         # As we pass through the layers
         # Meaning of Row i: "Absorbing context from the words before me", each word "talks" to the previous ones
-        #    (`attn_mask` restricts that to earlier words of its OWN request, never pads)
+        #    (`meta.attn_mask` restricts that to earlier words of its OWN request, never pads)
         
         for layer in self.layers:
-            x = layer(x, positions, attn_mask, self.rope, kv_cache=kv_cache)
+            x = layer(x, meta, self.rope, kv_cache=kv_cache)
 
         #after completing all the layers
         # Meaning of Row i: "What word should come right after me?"
@@ -106,10 +109,11 @@ class TransformerModel(nn.Module):
         #    Rescales each row's 576 numbers back to unit root-mean-square magnitude after 30 layers of additions.
         x = self.norm(x)
 
-        #    Keep only the last column: [B, T, hidden_size] -> [B, hidden_size]
-        #    It is the only row whose prediction we need, and left padding guarantees it is a
-        #    real token in every request. Skipping lm_head for the rest saves ~20% of prefill FLOPs.
-        x = x[:, -1]
+        #    Keep only each row's last real token: [B, T, hidden_size] -> [B, hidden_size]
+        #    It is the only token whose prediction we need. With right padding it sits at a
+        #    different column per row (`meta.last_idx`), and the columns after it are pads.
+        #    Skipping lm_head for the rest saves ~20% of prefill FLOPs.
+        x = x[torch.arange(batch_size), meta.last_idx]
 
         # 4. Project to vocabulary scores (logits): [B, hidden_size] -> [B, vocab_size]
         # at this point the last row of x contains 576 floats which in some weird dimension describe the next token

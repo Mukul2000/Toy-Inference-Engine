@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from inference_engine.config import ModelConfig
+from inference_engine.executor.batch_metadata import BatchMetadata
 from inference_engine.models.rope import RotaryEmbedding
 from inference_engine.models.attention import Attention
 from inference_engine.models.mlp import SwiGLUMLP
@@ -23,15 +24,12 @@ class TransformerBlock(nn.Module):
     def forward(
         self,
         x: torch.Tensor,
-        positions: torch.Tensor,
-        attn_mask: torch.Tensor,
+        meta: BatchMetadata,
         rope: RotaryEmbedding,
         kv_cache: Optional[Any] = None,
     ) -> torch.Tensor:
-        # Only self_attn mixes rows, so only it needs `positions` and `attn_mask`;
+        # Only self_attn mixes rows, so only it needs `meta`;
         # the norms and MLP treat every token row independently.
-        x = x + self.self_attn(
-            self.input_layernorm(x), positions, attn_mask, rope, kv_cache=kv_cache
-        )
+        x = x + self.self_attn(self.input_layernorm(x), meta, rope, kv_cache=kv_cache)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x

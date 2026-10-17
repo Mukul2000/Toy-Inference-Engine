@@ -759,7 +759,7 @@ Every later feature is a new decision in Layer 1, new machinery in Layer 2, or b
 | :--- | :--- | :--- |
 | Benchmarks | 32 requests, 8 slots, varied `max_new_tokens`; waste metrics | — |
 | Paged KV (Milestone 3) | block manager: free list, block tables; pool sized from a memory budget | block pool; attention reads K/V through block tables |
-| Chunked prefill (Milestone 4) | token budget; split prompts; mix chunks with decodes | mixed batches, likely packed without pads |
+| Chunked prefill (Milestone 4, §7) | token budget; split prompts; mix chunks with decodes | packed batches; attention in two groups |
 | Prefix caching | hash and share blocks | nothing beyond paging |
 | Temperature / top-p | per-request parameters in each row | a sampler |
 
@@ -775,3 +775,255 @@ Every later feature is a new decision in Layer 1, new machinery in Layer 2, or b
 | Rows down, token ids up | one row shape covers prefill and decode; ids are small, logits are big (6.7) |
 | Slot bookkeeping in Layer 1, bytes in Layer 2 | Layer 1's decisions take and free slots (6.7) |
 | Batching policies as one admission rule | they differ only in when requests may join (6.8) |
+
+---
+
+## 7. Milestone 4 Design: Chunked Prefill
+
+This milestone is designed before paged KV (Milestone 3) because the two are independent: chunked prefill works on §6's contiguous slots, and paging changes nothing here. The story follows the same pattern as §6.
+
+**The chain**: M2 makes every running request wait while a newcomer prefills (7.1) → prefill can resume from the cache, and a decode step has spare compute (7.2) → so each step gets a token budget: decodes first, then a chunk of a prompt (7.3), without changing any answer (7.4) → mixing needs a batch with no rectangle (7.5) → and attention on such a batch needs care (7.6). Then a traced step (7.7), the code (7.8), the decisions (7.9), the tests (7.10) and a recap (7.11).
+
+### 7.1 The Problem M2 Leaves Behind
+
+In M2, a step is all prefill or all decode (§6.5). While a newcomer prefills, every running request waits. With our 56-token prompts that's mild: one 84 ms pause where a decode step would take 52 ms.
+
+The pause grows with the prompt. A 2,000-token prompt would take roughly 3 s on this CPU (a linear extrapolation, not measured), and for those 3 s, every user who is mid-answer sees their output freeze. Two latency metrics pull in opposite directions:
+
+- **TTFT** (time to first token) of the newcomer wants its prefill done now, in one go.
+- **ITL** (inter-token latency) of everyone else wants no step to be long.
+
+### 7.2 Two Facts That Make Chunking Possible
+
+**Prefill can resume from the cache.** Prefilling `[0:5]` and then `[5:12]` leaves the same K/V in the slot as prefilling `[0:12]` in one pass (7.4 shows why). The second piece is just a row that starts at column 5:
+
+```python
+ScheduledSeq(seq_id=4, slot=3, start=0, token_ids=prompt[0:5])    # chunk 1
+ScheduledSeq(seq_id=4, slot=3, start=5, token_ids=prompt[5:12])   # chunk 2: the same row type
+```
+
+§6's contract already carries chunks. A piece of a prompt is called a **chunk**: the next tokens that aren't in the slot yet, capped in length. M2's prefill is the special case of one chunk that holds the whole prompt.
+
+**A decode step has spare compute.** Decode streams all the weights for a handful of tokens (§5). Measured: `[8, 1]` takes 52 ms and `[1, 56]` takes 84 ms, so 7× the tokens cost 1.6× the time. Prompt tokens can ride along with the decodes almost for free.
+
+### 7.3 The Idea: A Token Budget per Step
+
+Each step gets a **token budget**: a cap on the total tokens in one pass, summed over all rows. The scheduler fills it in priority order:
+
+1. One token for every request that is decoding, so nobody stalls.
+2. The rest of the prompt that is already being prefilled, as much as fits.
+3. Newcomers, admitted in arrival order while budget and free slots remain, each getting as much of its prompt as fits.
+
+Only the last prompt admitted can be cut short, so at most one prefill is ever unfinished.
+
+Example: budget 8. R1, R2 and R3 are decoding (lengths 7, 4, 5). R4 arrives with a 12-token prompt `p0 … p11` and gets slot 3:
+
+```
+step  decodes (1 token each)    budget left   R4's chunk                 tokens   R4's sample
+k     R1 R2 R3                  5             start 0,  [p0 … p4]        8        discarded
+k+1   R1 R2 R3                  5             start 5,  [p5 … p9]        8        discarded
+k+2   R1 R2 R3                  5             start 10, [p10 p11]        5        q: R4's first token
+k+3   R1 R2 R3 R4 [q]           4             —                          4
+```
+
+- R1–R3 get a token **every** step: no freezes.
+- R4's first token arrives after 3 steps instead of 1: some TTFT traded for smooth ITL.
+- Layer 2 still returns one token per row. For a chunk that ends mid-prompt, that token is the model's guess at the next **prompt** token, which we already know, so Layer 1 discards it.
+
+Slot 3 fills chunk by chunk, with no pads:
+
+```
+column:       0  1  2  3  4  5  6  7  8  9  10  11  12
+after k:      p0 p1 p2 p3 p4                                 num_computed_tokens 5
+after k+1:    p0 p1 p2 p3 p4 p5 p6 p7 p8 p9                  num_computed_tokens 10
+after k+2:    p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11          num_computed_tokens 12, prompt done
+after k+3:    p0 p1 p2 p3 p4 p5 p6 p7 p8 p9 p10 p11 q        decoding, like any other row
+```
+
+This is "stall-free scheduling" from the Sarathi-Serve paper (OSDI 2024). In vLLM, the budget is `max_num_batched_tokens`.
+
+### 7.4 Why Chunking Doesn't Change the Answer
+
+Follow `p7` at step k+1. In a one-shot prefill, its query attends to `p0 … p7`. Chunked, it attends to:
+
+- `p0 … p4`: K/V read from the slot, written at step k;
+- `p5 … p7`: K/V written in this step, before the read (the slot pool writes, then gathers, §6.9).
+
+That's the same set of keys. And the K/V of `p0 … p4` are the same as in a one-shot pass, because under the causal mask a token's K/V in every layer depends only on the tokens up to it. This is the argument that makes the KV cache valid at all: a chunk is a prefill that resumes from the cache. (The float-level batch-invariance caveat of §5.4 still applies.)
+
+### 7.5 Mixing Needs a Batch Without a Rectangle
+
+§6.5 ruled that prefill and decode never share a step. That rule rested on three facts, and chunked prefill changes each one:
+
+| Why mixing was bad in §6.5 | What changes here |
+| :--- | :--- |
+| **Pads.** The batch was a `[B, T]` rectangle, so a 1-token decode row was padded to the prompt's width: 448 positions for 63 real tokens. | **The batch is packed.** Real tokens are laid end to end with no pads, so a decode row costs one token. |
+| **Overflow.** Pad columns could be written past the end of a slot. | Without pads, a row writes only its real tokens, so it can't run past its slot. |
+| **Unbounded cost.** A whole prompt rode along, so a 2,000-token prompt meant a 2,000-token step. | **Bounded cost.** A chunk is at most the budget, so no step grows beyond it. |
+
+So the two new ingredients have different jobs. The **packed layout** is what *allows* prefill and decode in one step; the **token budget** is what *bounds* each step.
+
+**Packed** means the step's tokens form one flat sequence, and each token carries its own slot and position. Take step k+1 from 7.3 (R1–R3 decode `a'`, `b'`, `c'`):
+
+```
+token:      p5   p6   p7   p8   p9   a'   b'   c'
+slot:       3    3    3    3    3    0    1    2
+position:   5    6    7    8    9    8    5    6
+```
+
+Everything except attention works row by row and never asks which request a token came from: embedding, RMSNorm, the q/k/v/o projections, RoPE (each token rotated by its own position), the MLP, and the KV write (`k_cache[layer, slot[i], position[i]] = k[i]`). That's also where most of the compute is. `lm_head` runs only on each request's last token.
+
+Attention is the only op that mixes tokens, so it's the only one that must respect request boundaries: each query may see only **its own slot**, up to **its own position**.
+
+### 7.6 Attention on a Packed Batch
+
+Three ways to do that were considered.
+
+**B: one flat call with a block-diagonal mask.** Gather every request's history into one long key list and run one SDPA call, with a mask that lets each query see only its own request's keys, up to its position:
+
+```
+keys:        R1: cols 0-8      R2: 0-5     R3: 0-6      R4: cols 0-9
+query p5     ·········         ······      ·······      ✓✓✓✓✓✓····
+ …
+query p9     ·········         ······      ·······      ✓✓✓✓✓✓✓✓✓✓
+query a'     ✓✓✓✓✓✓✓✓✓         ······      ·······      ··········
+query b'     ·········         ✓✓✓✓✓✓      ·······      ··········
+query c'     ·········         ······      ✓✓✓✓✓✓✓      ··········
+```
+
+This is the shape real engines use (vLLM's one attention call per layer, with `query_start_loc` marking where each request's tokens start). But in plain PyTorch, SDPA with a dense mask computes **every** cell and then discards the masked ones, so the waste grows as tokens × total keys. Engines avoid that with *varlen* kernels (FlashAttention) that skip masked tiles: custom-kernel territory.
+
+**C1: one padded rectangle, inside attention only.** Regroup the queries into `[B, T_max]`, run §6's rectangle attention, then pack the outputs again. The pads now exist only inside attention (the linears still see 8 tokens), but 12 of the 20 query rows here are pads.
+
+**C2: two rectangles, grouped by shape.** Rows with more than one token form a **chunk group**, rows with one token form a **decode group**. The executor puts chunk tokens first, so each group is a contiguous slice of the packed tensor, and each group is an ordinary §6 rectangle:
+
+```
+packed:   p5 p6 p7 p8 p9 | a' b' c'
+          └─ chunk group ─┘└decode group┘
+
+chunk group   [1 × 5] queries, keys [1 × 10]   ← §6's prefill shape
+decode group  [3 × 1] queries, keys [3 × 9]    ← §6's decode shape
+```
+
+Grouping is by shape, not by kind: a 1-token final chunk is mathematically a decode row (one query at position `start`), so it joins the decode group, and Layer 2 still never asks "prefill or decode?" (§6.7). vLLM V0 did the same with chunked prefill on: prefill tokens first, decode tokens after, a different kernel for each slice.
+
+At a realistic size (8 slots: 7 requests decoding with ~500 tokens of history, plus a 64-token chunk starting at column 500; 71 tokens), by rough arithmetic:
+
+| | Attention scores per head | Real | Useful |
+| :--- | ---: | ---: | ---: |
+| B, dense mask | 71 × 4,071 keys = 289k | 37.6k | 13% |
+| C1, one rectangle | 8 × 64 queries × 564 keys = 289k | 37.6k | 13% |
+| **C2, two groups** | 7 × 501 + 64 × 564 = 39.6k | 37.6k | **95%** |
+
+B and C1 would spend about 20 GFLOP per step on attention, more than all the linear layers combined (~15 GFLOP for 71 tokens). C2 spends about 3 GFLOP.
+
+**We choose C2.** It's the right shape for plain PyTorch SDPA, and it's the smallest step from §6: the contract, the slot pool and the rectangle attention all stay. B becomes attractive only with a varlen kernel that reads K/V straight from the cache, a natural partner for paged KV later.
+
+### 7.7 Step k+1, Traced Through C2
+
+The rows arrive in any order: `R1 [a'] · R2 [b'] · R3 [c'] · R4 start 5 [p5 … p9]`.
+
+1. **Pack** (executor): multi-token rows first. `input_ids` is the flat `[p5 p6 p7 p8 p9 a' b' c']`, with per-token slots and positions as in 7.5.
+2. **Outside attention**: embedding, norms, projections, RoPE and the MLP run on `[8, H]`.
+3. **Inside attention**: write all 8 tokens' K/V to their slots, then run the two groups:
+
+```
+chunk group: queries [1 × 5], keys = slot 3, columns 0-9, mask k ≤ q
+                 key col:  0  1  2  3  4  5  6  7  8  9
+         p5 (pos 5)        ✓  ✓  ✓  ✓  ✓  ✓  ·  ·  ·  ·
+         p6 (pos 6)        ✓  ✓  ✓  ✓  ✓  ✓  ✓  ·  ·  ·
+         …
+         p9 (pos 9)        ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓  ✓
+                           └ from step k ┘└ this step ┘
+
+decode group: queries [3 × 1], keys = slots 0, 1, 2, columns 0-8, mask k ≤ q   (§6's decode step)
+```
+
+4. **`lm_head`** on each row's last token: packed indices `[4, 5, 6, 7]`, i.e. `p9`, `a'`, `b'`, `c'`.
+5. **Unsort**: return one token per row, in the order the rows arrived.
+
+When several prompts are prefilled in one step (7.9, decision 1), the chunk group has several rows and pads them to the longest, inside attention only. At cold start, that is exactly §6's right-padded prefill.
+
+### 7.8 Putting It into Code
+
+**`Sequence`** gets one property, and `next_input()` gets a cap:
+
+```python
+@property
+def is_prefilling(self) -> bool:                  # some prompt tokens are not in the slot yet
+    return self.num_computed_tokens < len(self.request.prompt_ids)
+
+def next_input(self, limit: int) -> list[int]:    # §6's rule, with a cap
+    start = self.num_computed_tokens
+    return (self.request.prompt_ids + self.output_ids)[start : start + limit]
+```
+
+**`Scheduler.schedule()`** fills the budget (7.3):
+
+```python
+def schedule(self) -> SchedulerOutput | None:
+    budget, rows = self.token_budget, []
+    def take(seq, limit):                         # add one row, spend its tokens
+        nonlocal budget
+        row = ScheduledSeq(seq.seq_id, seq.slot, seq.num_computed_tokens, seq.next_input(limit))
+        rows.append(row); budget -= len(row.token_ids)
+
+    for seq in self.running:                      # 1. every decoding sequence: 1 token
+        if not seq.is_prefilling: take(seq, 1)
+    for seq in self.running:                      # 2. finish the prefill already in progress
+        if seq.is_prefilling and budget > 0: take(seq, budget)
+    while budget > 0 and self.waiting and self.free_slots and self.may_admit():
+        take(self.admit(self.waiting.popleft()), budget)   # 3. newcomers, with what is left
+    return SchedulerOutput(rows) if rows else None
+```
+
+**`Scheduler.update()`** discards samples of partial chunks:
+
+```python
+for row, tok in zip(batch.seqs, token_ids):
+    seq = self.seqs[row.seq_id]
+    seq.num_computed_tokens += len(row.token_ids)
+    if seq.is_prefilling:
+        continue                                  # partial chunk: its sample is meaningless
+    seq.output_ids.append(tok)                    # last chunk or decode: a real new token
+    ...                                           # EOS / max_new_tokens checks, as in §6
+```
+
+What changes, relative to §6:
+
+| Component | Change |
+| :--- | :--- |
+| `contract.py` | nothing: `ScheduledSeq` already carries chunks through `start` |
+| `Sequence` | `is_prefilling`; `next_input(limit)` |
+| `Scheduler` | the budget fill in `schedule()`; the partial-chunk discard in `update()` |
+| `Engine` | `token_budget` argument; rejects `token_budget <= num_slots` |
+| `ModelExecutor`, `BatchMetadata` | pack tokens; split rows into two groups by shape, each with §6's metadata; unsort the outputs |
+| `Attention` | two rectangle SDPA calls on two slices instead of one |
+| models outside attention | run on packed `[N, H]` instead of `[B, T, H]`; otherwise unchanged |
+| KV slot pool | unchanged |
+
+### 7.9 Decisions
+
+| # | Decision | Why |
+| :--- | :--- | :--- |
+| D1 | **Several prompts per step**: leftover budget admits as many newcomers as fit | With one prompt per step, 8 empty slots fill in 8 steps; M2 fills them in 1. Several prompts cost only padding inside the chunk group's attention. |
+| D2 | **Budget must exceed `num_slots`**; start around 64 for 8 slots, chosen by measurement | If decodes alone used up the budget, waiting prompts would never progress. vLLM has a similar rule. |
+| D3 | **Layer 1 discards samples of partial chunks** | Keeps the contract unchanged. Costs one wasted `lm_head` row per partial chunk (576 × 49,152 multiply-adds, negligible). The alternative is a `sample` flag in `ScheduledSeq`. |
+| D4 | **Chunking only for the continuous policy** | Static and naive keep §6's behaviour (an unlimited budget). Chunking exists to protect running requests from newcomers, and only continuous batching admits newcomers while others run. |
+
+### 7.10 How We'll Know It Works
+
+1. **Same answers**: with a small budget (so every prompt is chunked), continuous batching still reproduces §6's answer key.
+2. **Layer 1 alone** (fake executor): no step exceeds the budget; every decoding request gets a token in every step; at most one prefill is unfinished at a time; partial-chunk samples are never appended.
+3. **Layer 2 alone** (tiny model): prefilling a prompt in chunks of 1, 3 and 7 tokens gives the same logits as one pass, within float tolerance; a 1-token chunk lands in the decode group.
+4. **Before choosing the budget**: measure step time against tokens per step, and measure the stall a long prompt causes under M2.
+
+### 7.11 Recap
+
+| Decision | Why |
+| :--- | :--- |
+| A token budget per step: decodes first, then prompt chunks | running requests never stall; prompts progress in bounded pieces (7.3) |
+| A chunk is a row with `start > 0` | prefill resumes from the cache, so the contract doesn't change (7.2, 7.4) |
+| Packed batches | no rectangle, so no pads: the reason §6.5 gave against mixing disappears (7.5) |
+| Attention in two groups by shape (C2) | plain SDPA wastes almost nothing; reuses §6's rectangle attention (7.6) |
+| Several prompts per step, budget > slots, discard partial samples, continuous only | 7.9 |
