@@ -45,15 +45,16 @@ def test_executor_driven_by_hand_reproduces_reference(smollm_executor, reference
 
 
 @pytest.mark.parametrize(
-    "policy, num_slots",
+    "policy, num_slots, token_budget",
     [
-        (BatchingPolicy.STATIC, 1),  # naive
-        (BatchingPolicy.STATIC, 3),
-        (BatchingPolicy.CONTINUOUS, 3),  # 8 requests on 3 slots: slots are reused mid-run
+        (BatchingPolicy.STATIC, 1, None),  # naive
+        (BatchingPolicy.STATIC, 3, None),
+        (BatchingPolicy.CONTINUOUS, 3, None),  # 8 requests on 3 slots: slots are reused mid-run
+        (BatchingPolicy.CONTINUOUS, 3, 16),  # chunked prefill: every prompt is split
     ],
 )
-def test_every_policy_reproduces_reference(smollm_executor, reference, policy, num_slots):
-    engine = Engine(smollm_executor, policy, num_slots=num_slots, max_seq_len=128)
+def test_every_policy_reproduces_reference(smollm_executor, reference, policy, num_slots, token_budget):
+    engine = Engine(smollm_executor, policy, num_slots, max_seq_len=128, token_budget=token_budget)
     requests = [Request(item["prompt_ids"], reference["max_new_tokens"]) for item in reference["requests"]]
     outputs = engine.generate(requests)
     assert_matches_reference(smollm_executor.model, reference, [o.token_ids for o in outputs])

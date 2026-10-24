@@ -63,57 +63,58 @@ class TransformerModel(nn.Module):
         kv_cache: Optional[ContiguousKVCache] = None,
     ) -> torch.Tensor:
         """
-        Batched forward pass over B right-padded rows (a single request is just B = 1).
-        `meta` (see `BatchMetadata`) says where each row's tokens sit: its slot in `kv_cache`,
-        its first column, its positions, the attention mask, and which token is its last real one.
-        `meta=None` means fresh, unpadded rows that all start at column 0 (experiments, HF parity).
+        Forward pass over a packed batch: the B rows' tokens laid end to end, N in total, no pads.
+        `meta` (see `BatchMetadata`) says where each token sits (its slot in `kv_cache` and its
+        column there), how attention groups the rows, and which token is each row's last.
+        `meta=None` means fresh rows that all start at column 0, passed as a [B, T] rectangle
+        (experiments, HF parity); they are packed here.
 
-        Dimensions & Meaning of Matrix `x` (B = batch size, T = new tokens per row,
+        Dimensions & Meaning of Matrix `x` (N = packed tokens of all rows, B = rows,
         H = hidden_size (576), V = vocab_size (49152)):
-          - input_ids      : [B, T]    -> T new token IDs for each of the B rows (right-padded).
-          - meta.positions : [B, T]    -> Position of each token within its OWN request (= its column in its slot).
-          - x              : [B, T, H] -> One 576-float vector per token. After passing through the
-                                          30 layers, `x[b, i]` holds the hidden representation predicting
-                                          the word that comes AFTER token `i` of request `b`.
-                                          For generation, we only care about each row's last REAL token
-                                          (`x[b, meta.last_idx[b]]`), which predicts the word that comes
-                                          after each entire sequence!
-          - logits         : [B, V]    -> Vocabulary similarity scores for the next token of each request.
+          - input_ids      : [N]    -> the new token IDs of all B rows, end to end.
+          - meta.positions : [N]    -> Position of each token within its OWN request (= its column in its slot).
+          - x              : [N, H] -> One 576-float vector per token. After passing through the
+                                       30 layers, `x[i]` holds the hidden representation predicting
+                                       the word that comes AFTER token `i` (within its own request).
+                                       For generation, we only care about each row's last token
+                                       (`x[meta.last_idx[b]]`), which predicts the word that comes
+                                       after each entire sequence!
+          - logits         : [B, V] -> Vocabulary similarity scores for the next token of each request.
         """
-        batch_size, num_new_tokens = input_ids.shape
         if meta is None:
+            batch_size, num_new_tokens = input_ids.shape
             meta = BatchMetadata.build(
                 slot_ids=list(range(batch_size)),
                 starts=[0] * batch_size,
                 lengths=[num_new_tokens] * batch_size,
             )
+            input_ids = input_ids.reshape(-1)  # rows end to end: the packed layout
         # `meta` is built once, outside the model, and shared by all 30 layers
 
-        # 1. Lookup initial token embeddings: [B, T] -> [B, T, hidden_size]
+        # 1. Lookup initial token embeddings: [N] -> [N, hidden_size]
         # each token is represented by `hidden_size` floating point numbers
         # these are the initial representations, Meaning of Row i: "Who am I in isolation?" 
         x = self.embed_tokens(input_ids)
 
-        # 2. Pass through all 30 Transformer layers: [B, T, hidden_size] -> [B, T, hidden_size]
+        # 2. Pass through all 30 Transformer layers: [N, hidden_size] -> [N, hidden_size]
         #    (Each layer adds Attention + MLP updates onto `x` via residual connections: x = x + delta)
         # As we pass through the layers
         # Meaning of Row i: "Absorbing context from the words before me", each word "talks" to the previous ones
-        #    (`meta.attn_mask` restricts that to earlier words of its OWN request, never pads)
+        #    (`meta.groups` restrict that to earlier words of its OWN request)
         
         for layer in self.layers:
             x = layer(x, meta, self.rope, kv_cache=kv_cache)
 
         #after completing all the layers
         # Meaning of Row i: "What word should come right after me?"
-        # 3. Final RMSNorm: [B, T, hidden_size] -> [B, T, hidden_size]
+        # 3. Final RMSNorm: [N, hidden_size] -> [N, hidden_size]
         #    Rescales each row's 576 numbers back to unit root-mean-square magnitude after 30 layers of additions.
         x = self.norm(x)
 
-        #    Keep only each row's last real token: [B, T, hidden_size] -> [B, hidden_size]
-        #    It is the only token whose prediction we need. With right padding it sits at a
-        #    different column per row (`meta.last_idx`), and the columns after it are pads.
-        #    Skipping lm_head for the rest saves ~20% of prefill FLOPs.
-        x = x[torch.arange(batch_size), meta.last_idx]
+        #    Keep only each row's last token: [N, hidden_size] -> [B, hidden_size]
+        #    It is the only token whose prediction we need; in the packed layout it sits at
+        #    `meta.last_idx[b]`. Skipping lm_head for the rest saves ~20% of prefill FLOPs.
+        x = x[meta.last_idx]
 
         # 4. Project to vocabulary scores (logits): [B, hidden_size] -> [B, vocab_size]
         # at this point the last row of x contains 576 floats which in some weird dimension describe the next token

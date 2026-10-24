@@ -34,10 +34,11 @@ class RotaryEmbedding(nn.Module):
             q: [B, T, num_q_heads, head_dim]
             k: [B, T, num_kv_heads, head_dim]
             positions: [B, T] position of each token within its OWN request
+                       (or [N] for packed tokens, with q, k as [N, heads, head_dim])
         """
         # Every head of a token gets the same rotation: a heads axis of size 1 broadcasts
-        cos = rearrange(self.cos_cached[positions], "b t d -> b t 1 d").to(q.dtype)
-        sin = rearrange(self.sin_cached[positions], "b t d -> b t 1 d").to(q.dtype)
+        cos = rearrange(self.cos_cached[positions], "... d -> ... 1 d").to(q.dtype)
+        sin = rearrange(self.sin_cached[positions], "... d -> ... 1 d").to(q.dtype)
         q_rot = (q * cos) + (self._rotate_half(q) * sin)
         k_rot = (k * cos) + (self._rotate_half(k) * sin)
         return q_rot, k_rot

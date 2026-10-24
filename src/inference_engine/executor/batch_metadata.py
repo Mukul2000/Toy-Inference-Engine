@@ -1,52 +1,56 @@
 from dataclasses import dataclass
 
 import torch
-from einops import rearrange
+
+from inference_engine.executor.attention_group import AttentionGroup
 
 
 @dataclass(frozen=True)
 class BatchMetadata:
     """
-    The tensor layout of ONE forward pass (design_doc.md §6.9). The executor builds it from
-    the rows Layer 1 scheduled; every layer passes it down to attention.
+    The tensor layout of ONE forward pass over a packed batch. The executor builds it from the rows Layer 1
+    scheduled; every layer passes it down to attention.
 
-    Rows are right-padded to T = the longest row. Row b's real tokens sit at columns
-    starts[b] .. starts[b] + lengths[b] - 1 of its slot, so column = position, and its pads
-    land after them, where nothing reads them.
+    The rows' tokens are laid end to end with no pads: [N] tokens in total. Outside attention
+    every op works token by token and only needs `positions`. Attention also needs to know
+    which request each token belongs to; it gets that from `groups`.
 
-    Example (§6.9, step 1): seq 0 in slot 0 with 5 tokens cached, seq 1 in slot 2 with 3,
-    one new token each:
-        slot_ids = [0, 2], starts = [5, 3], lengths = [1, 1]
-        positions = [[5], [3]]     S = max(starts) + T = 6     last_idx = [0, 0]
-        attn_mask, seq 1 (query at column 3):   key column  0 1 2 3 4 5
-                                                            ✓ ✓ ✓ ✓ · ·
+    Rows must arrive in packed order: every multi-token row (prefill or chunk) before every
+    1-token row (decode). Example: R4's chunk, then R1-R3's decodes
+        slot_ids = [3, 0, 1, 2]   starts = [5, 8, 5, 6]   lengths = [5, 1, 1, 1]
+        packed:     p5 p6 p7 p8 p9 | a' b' c'
+        positions = [5  6  7  8  9 | 8  5  6]
+        slots     = [3  3  3  3  3 | 0  1  2]
+        groups    = chunk group (tokens 0-4, 1 row), decode group (tokens 5-7, 3 rows)
+        last_idx  = [4, 5, 6, 7]
     """
 
-    positions: torch.Tensor  # [B, T]        column (= RoPE position) of every new token
-    attn_mask: torch.Tensor  # [B, 1, T, S]  True = may attend; S = max(starts) + T
-    slot_ids: torch.Tensor  # [B]           the slot each row reads and extends
-    starts: torch.Tensor  # [B]           column of each row's first new token
-    last_idx: torch.Tensor  # [B]           lengths - 1: the token whose output predicts the next one
+    positions: torch.Tensor  # [N] column (= RoPE position) of every token in its slot
+    slots: torch.Tensor  # [N] slot of every token: where its K/V is written
+    groups: tuple[AttentionGroup, ...]  # chunk group, then decode group (either may be absent)
+    last_idx: torch.Tensor  # [B] packed index of each row's last token: it predicts the next one
 
     @classmethod
     def build(cls, slot_ids: list[int], starts: list[int], lengths: list[int]) -> "BatchMetadata":
-        slot_ids_t, starts_t, lengths_t = (
-            torch.tensor(v, dtype=torch.long) for v in (slot_ids, starts, lengths)
-        )
-        num_new_tokens = int(lengths_t.max())
-        seq_len = int(starts_t.max()) + num_new_tokens
+        num_chunk_rows = sum(n > 1 for n in lengths)
+        if any(n > 1 for n in lengths[num_chunk_rows:]):
+            raise ValueError("rows with more than one token must come before 1-token rows")
 
-        q_col = rearrange(starts_t, "b -> b 1") + torch.arange(num_new_tokens)  # [B, T]
-        k_col = torch.arange(seq_len)  # [S]
-        # One rule: attend iff k_col <= q_col. A row's real tokens come before its pads and
-        # before any stale columns of its slot's previous owner, so this one comparison hides
-        # future tokens, pads and stale data. Every query sees at least itself: no NaN rows.
-        attn_mask = rearrange(k_col, "s -> 1 1 s") <= rearrange(q_col, "b t -> b t 1")
+        positions = torch.cat([torch.arange(s, s + n) for s, n in zip(starts, lengths)])
+        slots = torch.repeat_interleave(torch.tensor(slot_ids), torch.tensor(lengths))
+        last_idx = torch.tensor(lengths).cumsum(0) - 1
 
-        return cls(
-            positions=q_col,
-            attn_mask=rearrange(attn_mask, "b t s -> b 1 t s"),
-            slot_ids=slot_ids_t,
-            starts=starts_t,
-            last_idx=lengths_t - 1,
-        )
+        # Group by shape, not by kind: a 1-token final chunk is a decode row mathematically
+        groups, offset = [], 0
+        for rows in (range(num_chunk_rows), range(num_chunk_rows, len(lengths))):
+            if rows:
+                group = AttentionGroup.build(
+                    offset,
+                    [slot_ids[i] for i in rows],
+                    [starts[i] for i in rows],
+                    [lengths[i] for i in rows],
+                )
+                groups.append(group)
+                offset = group.tokens.stop
+
+        return cls(positions=positions, slots=slots, groups=tuple(groups), last_idx=last_idx)

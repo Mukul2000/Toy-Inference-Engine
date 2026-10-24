@@ -19,15 +19,22 @@ class Engine:
         policy: BatchingPolicy = BatchingPolicy.CONTINUOUS,
         num_slots: int = 8,
         max_seq_len: int = 512,
+        token_budget: int | None = None,
     ):
+        """`token_budget`: max tokens per step, which turns on chunked prefill (§7). None = unlimited."""
         spec = executor.model_spec()  # up: the model's limits
         if max_seq_len > spec.max_model_len:
             raise ValueError(f"max_seq_len {max_seq_len} > the model's {spec.max_model_len}")
+        if token_budget is not None:
+            if policy is not BatchingPolicy.CONTINUOUS:
+                raise ValueError("chunked prefill is for the continuous policy (design_doc.md §7.9, D4)")
+            if token_budget <= num_slots:
+                raise ValueError("token_budget must exceed num_slots, or decodes alone could use it up")
         executor.allocate_kv_cache(num_slots, max_seq_len)  # down: the pool shape Layer 1 chose
         self.executor = executor
         self.num_slots = num_slots
         self.max_seq_len = max_seq_len
-        self.scheduler = Scheduler(num_slots, policy, spec.eos_token_id)
+        self.scheduler = Scheduler(num_slots, policy, spec.eos_token_id, token_budget)
         # Per step: the rows that ran, and slot -> seq_id of every running sequence (for timelines)
         self.trace: list[tuple[SchedulerOutput, dict[int, int]]] = []
         self._seqs: dict[int, Sequence] = {}

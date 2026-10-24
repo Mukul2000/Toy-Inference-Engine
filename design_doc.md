@@ -997,10 +997,14 @@ What changes, relative to §6:
 | `Sequence` | `is_prefilling`; `next_input(limit)` |
 | `Scheduler` | the budget fill in `schedule()`; the partial-chunk discard in `update()` |
 | `Engine` | `token_budget` argument; rejects `token_budget <= num_slots` |
-| `ModelExecutor`, `BatchMetadata` | pack tokens; split rows into two groups by shape, each with §6's metadata; unsort the outputs |
-| `Attention` | two rectangle SDPA calls on two slices instead of one |
+| `ModelExecutor` | pack tokens, multi-token rows first; unsort the outputs |
+| `BatchMetadata` | per-token `positions` and `slots` `[N]`, `last_idx` into the packed tokens, and up to two groups |
+| `AttentionGroup` (new) | one rectangle: its slice of the packed tokens, slot ids, packed-to-rectangle index, `k ≤ q` mask |
+| `Attention` | write all new K/V once, then one rectangle SDPA call per group |
 | models outside attention | run on packed `[N, H]` instead of `[B, T, H]`; otherwise unchanged |
-| KV slot pool | unchanged |
+| KV slot pool | `update()` splits into `write()` (scatter by token, no pads) and `read()` (gather per group) |
+
+With no budget, the same `schedule()` adds whole prompts to decode steps: continuous batching without §6.5's pause (packing removed the reason for it). Static batching with no budget runs exactly as in §6.
 
 ### 7.9 Decisions
 

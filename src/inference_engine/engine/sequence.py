@@ -28,10 +28,16 @@ class Sequence:
     first_token_time: float | None = None
     finish_time: float | None = None
 
-    def next_input(self) -> list[int]:
+    @property
+    def is_prefilling(self) -> bool:
+        """Some prompt tokens are not in the slot yet."""
+        return self.num_computed_tokens < len(self.request.prompt_ids)
+
+    def next_input(self, limit: int) -> list[int]:
         """
-        The tokens not yet in the cache, i.e. this step's input for the row:
-          - just admitted, nothing computed:    the whole prompt (prefill row, start 0)
+        The next tokens not yet in the cache, at most `limit` of them: this step's input for the row.
+          - prefilling:                         the next chunk of the prompt (start = tokens cached)
           - running, all but the newest token:  the newest token (decode row, start = length)
         """
-        return (self.request.prompt_ids + self.output_ids)[self.num_computed_tokens :]
+        start = self.num_computed_tokens
+        return (self.request.prompt_ids + self.output_ids)[start : start + limit]

@@ -25,12 +25,14 @@ QUESTIONS = [
 MAX_NEW_TOKENS = 32
 MAX_SEQ_LEN = 128  # per slot: the longest prompt (56) + MAX_NEW_TOKENS fits
 
-# (name, policy, num_slots). The first one is the baseline. 3 slots for 8 requests, so
-# slots are freed and reused mid-run (design_doc.md §6.12).
+# (name, policy, num_slots, token_budget). The first one is the baseline. 3 slots for 8
+# requests, so slots are freed and reused mid-run (design_doc.md §6.12). A budget turns on
+# chunked prefill (§7); without one, continuous batching adds whole prompts to decode steps.
 POLICIES = [
-    ("Naive (1 slot)", BatchingPolicy.STATIC, 1),
-    ("Static (3 slots)", BatchingPolicy.STATIC, 3),
-    ("Continuous (3 slots)", BatchingPolicy.CONTINUOUS, 3),
+    ("Naive (1 slot)", BatchingPolicy.STATIC, 1, None),
+    ("Static (3 slots)", BatchingPolicy.STATIC, 3, None),
+    ("Continuous (3 slots)", BatchingPolicy.CONTINUOUS, 3, None),
+    ("Chunked, budget 16", BatchingPolicy.CONTINUOUS, 3, 16),
 ]
 
 
@@ -87,20 +89,24 @@ def check_parity(
         print(f"\n{name} vs. {base_name} parity: {status} ({n - mismatches}/{n} identical)\n")
 
 
-def print_timeline(name: str, engine: Engine, width: int = 100) -> None:
+def print_timeline(name: str, engine: Engine, requests: list[Request], width: int = 100) -> None:
     """
     The slot timeline of a run, in the format of design_doc.md §6.8, one column per step.
-    `kind`: P = prefill step, D = decode step. Each slot shows the request (by index) it holds:
-    `-` = holds the slot but paused by a prefill step, `.` = free.
+    `kind`: P = prefill rows only, D = decode rows only, M = mixed (decodes + prompt chunks).
+    Each slot shows the request (by index) it holds: a digit when it runs a decode row, `p` when
+    it runs a prefill row or chunk, `-` = holds the slot but sits the step out, `.` = free.
     """
     print(f"{name}: {len(engine.trace)} steps")
     kinds, cells = "", [""] * engine.num_slots
     for batch, occupancy in engine.trace:
-        kinds += "P" if batch.seqs[0].start == 0 else "D"
-        in_batch = {row.seq_id for row in batch.seqs}
+        prefill = {row.seq_id for row in batch.seqs if row.start < len(requests[row.seq_id].prompt_ids)}
+        decode = {row.seq_id for row in batch.seqs} - prefill
+        kinds += "M" if prefill and decode else "P" if prefill else "D"
         for slot in range(engine.num_slots):
             seq_id = occupancy.get(slot)
-            cells[slot] += "." if seq_id is None else str(seq_id) if seq_id in in_batch else "-"
+            cells[slot] += (
+                "." if seq_id is None else "p" if seq_id in prefill else str(seq_id) if seq_id in decode else "-"
+            )
     for begin in range(0, len(kinds), width):
         end = min(begin + width, len(kinds))
         ruler = "".join(f"{i:<10}" for i in range(begin, end, 10))[: end - begin]  # 0, 10, 20, ...
@@ -146,8 +152,8 @@ def main() -> None:
 
     # One executor (one model) serves every policy; each Engine allocates its own slot pool.
     engines, results = [], []
-    for name, policy, num_slots in POLICIES:
-        engine = Engine(executor, policy, num_slots=num_slots, max_seq_len=MAX_SEQ_LEN)
+    for name, policy, num_slots, token_budget in POLICIES:
+        engine = Engine(executor, policy, num_slots, MAX_SEQ_LEN, token_budget)
         t0 = time.perf_counter()
         outputs = engine.generate(requests)
         total_ms = (time.perf_counter() - t0) * 1000.0
@@ -156,7 +162,7 @@ def main() -> None:
 
     check_parity(tokenizer, executor.model, requests, [(name, outputs) for name, outputs, _, _ in results])
     for name, engine in engines[1:]:  # the baseline runs one request at a time: too many steps
-        print_timeline(name, engine)
+        print_timeline(name, engine, requests)
     print_summary(results)
 
 

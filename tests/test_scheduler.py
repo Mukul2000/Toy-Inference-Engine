@@ -41,9 +41,20 @@ def make_requests(new_tokens: list[int]) -> list[Request]:
     return [Request([100 + i] * (i + 2), n) for i, n in enumerate(new_tokens)]
 
 
-def run(policy: BatchingPolicy, num_slots: int, new_tokens: list[int], **kw) -> tuple[Engine, list]:
-    engine = Engine(FakeExecutor(**kw), policy, num_slots=num_slots, max_seq_len=64)
+def run(
+    policy: BatchingPolicy, num_slots: int, new_tokens: list[int], token_budget: int | None = None, **kw
+) -> tuple[Engine, list]:
+    engine = Engine(FakeExecutor(**kw), policy, num_slots, max_seq_len=64, token_budget=token_budget)
     return engine, engine.generate(make_requests(new_tokens))
+
+
+def kinds(engine: Engine, requests: list[Request]) -> str:
+    """One letter per step: P = prefill rows only, D = decode rows only, M = mixed."""
+    out = ""
+    for batch, _ in engine.trace:
+        prefill = [row.start < len(requests[row.seq_id].prompt_ids) for row in batch.seqs]
+        out += "M" if any(prefill) and not all(prefill) else "P" if all(prefill) else "D"
+    return out
 
 
 # The running example of design_doc.md §6.8: R1 needs 6 tokens, R2 and R3 need 2, R4 and R5 need 3.
@@ -54,7 +65,8 @@ EXAMPLE = [6, 2, 2, 3, 3]
     "policy, num_slots, steps",
     [
         (BatchingPolicy.STATIC, 3, 9),
-        (BatchingPolicy.CONTINUOUS, 3, 7),
+        # 7 in §6.8, where R1 paused for R4 and R5's prefill. Now their prompts join R1's decode.
+        (BatchingPolicy.CONTINUOUS, 3, 6),
         (BatchingPolicy.STATIC, 1, 16),  # naive
         (BatchingPolicy.CONTINUOUS, 1, 16),  # naive, either way
     ],
@@ -65,18 +77,18 @@ def test_step_counts_match_design_doc(policy, num_slots, steps):
     assert [len(o.token_ids) for o in outputs] == EXAMPLE
 
 
-def test_continuous_timeline_matches_design_doc():
+def test_continuous_timeline():
     engine, _ = run(BatchingPolicy.CONTINUOUS, 3, EXAMPLE)
-    kinds = ["P" if batch.seqs[0].start == 0 else "D" for batch, _ in engine.trace]
-    assert "".join(kinds) == "PDPDDDD"
+    assert kinds(engine, make_requests(EXAMPLE)) == "PDMDDD"
     step2, occupancy = engine.trace[2]
-    # R4, R5 (seq 3, 4) take the slots R2, R3 freed at step 1; R1 (seq 0) is paused
-    assert [(row.seq_id, row.slot) for row in step2.seqs] == [(3, 1), (4, 2)]
+    # R1 (seq 0) decodes; R4, R5 (seq 3, 4) prefill in the slots R2, R3 freed at step 1
+    assert [(row.seq_id, row.slot) for row in step2.seqs] == [(0, 0), (3, 1), (4, 2)]
     assert occupancy == {0: 0, 1: 3, 2: 4}
 
 
 def test_static_admits_only_into_an_empty_batch():
     engine, _ = run(BatchingPolicy.STATIC, 3, EXAMPLE)
+    assert kinds(engine, make_requests(EXAMPLE)) == "PDDDDDPDD"
     for batch, occupancy in engine.trace:
         if batch.seqs[0].start == 0:  # a prefill step: nobody else may be running
             assert set(occupancy.values()) == {row.seq_id for row in batch.seqs}
@@ -134,6 +146,53 @@ def test_requests_that_cannot_fit_a_slot_are_rejected():
         engine.add_request(Request([1] * 6, max_new_tokens=5))
     with pytest.raises(ValueError):
         Engine(FakeExecutor(), max_seq_len=8193)  # longer than the model's 8192
+
+
+def test_chunks_follow_the_budget_and_partial_samples_are_discarded():
+    # 1 slot, budget 4, a 10-token prompt: chunks [0:4], [4:8], [8:10], then decodes
+    engine = Engine(FakeExecutor(), BatchingPolicy.CONTINUOUS, num_slots=1, max_seq_len=64, token_budget=4)
+    (out,) = engine.generate([Request(list(range(100, 110)), max_new_tokens=3)])
+    rows = [(row.start, len(row.token_ids)) for batch, _ in engine.trace for row in batch.seqs]
+    assert rows == [(0, 4), (4, 4), (8, 2), (10, 1), (11, 1)]
+    assert out.token_ids == [TOKEN] * 3  # the samples of the first two chunks were dropped
+
+
+def test_budget_example_from_design_doc():
+    # §7.3: budget 8; three requests decoding when a 12-token prompt arrives
+    engine = Engine(FakeExecutor(), BatchingPolicy.CONTINUOUS, num_slots=4, max_seq_len=64, token_budget=8)
+    for request in make_requests([20, 20, 20]):
+        engine.add_request(request)
+    engine.step()  # prefill the three (2 + 3 + 4 = 9 tokens: 8 now, 1 next step)
+    engine.step()
+    engine.add_request(Request(list(range(200, 212)), max_new_tokens=5))
+    engine.step()
+    engine.step()
+    engine.step()
+    chunks = [(row.start, len(row.token_ids)) for batch, _ in engine.trace[2:] for row in batch.seqs if row.seq_id == 3]
+    assert chunks == [(0, 5), (5, 5), (10, 2)]
+
+
+@pytest.mark.parametrize("budget", [4, 7, 16])
+def test_budget_invariants(budget):
+    requests = make_requests([5, 1, 4, 2, 2, 6, 1, 3])
+    engine, outputs = run(BatchingPolicy.CONTINUOUS, 3, [r.max_new_tokens for r in requests], token_budget=budget)
+    assert [len(o.token_ids) for o in outputs] == [r.max_new_tokens for r in requests]
+    for batch, occupancy in engine.trace:
+        assert sum(len(row.token_ids) for row in batch.seqs) <= budget
+        # nobody holding a slot ever sits a step out
+        assert set(occupancy.values()) == {row.seq_id for row in batch.seqs}
+        # at most one prompt is left unfinished by a step
+        unfinished = [
+            row for row in batch.seqs if 0 < len(requests[row.seq_id].prompt_ids) - row.start - len(row.token_ids)
+        ]
+        assert len(unfinished) <= 1
+
+
+def test_budget_is_only_for_continuous_and_must_exceed_slots():
+    with pytest.raises(ValueError):
+        Engine(FakeExecutor(), BatchingPolicy.STATIC, num_slots=2, token_budget=16)
+    with pytest.raises(ValueError):
+        Engine(FakeExecutor(), BatchingPolicy.CONTINUOUS, num_slots=8, token_budget=8)
 
 
 def test_boot_handshake_allocates_the_pool_layer_1_chose():
