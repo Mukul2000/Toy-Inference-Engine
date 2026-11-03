@@ -9,6 +9,7 @@ import torch
 from inference_engine.config import ModelConfig
 from inference_engine.contract import ScheduledSeq, SchedulerOutput
 from inference_engine.executor import BatchMetadata, ContiguousKVCache, ModelExecutor
+from inference_engine.models.model_factory import ModelFactory
 from inference_engine.models.transformer import TransformerModel
 
 ATOL = 1e-5
@@ -20,7 +21,7 @@ def model() -> TransformerModel:
 
 
 def new_executor(model: TransformerModel, fill: str = "zeros") -> ModelExecutor:
-    executor = ModelExecutor(model)
+    executor = ModelExecutor(ModelFactory(model.config))  # seeded: same weights as `model`
     executor.allocate_kv_cache(num_slots=4, max_seq_len=32)
     if fill == "random":  # stale data from imaginary previous owners
         executor.kv_cache.k_cache.normal_()

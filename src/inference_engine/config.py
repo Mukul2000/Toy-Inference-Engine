@@ -89,3 +89,16 @@ class ModelConfig:
             num_attention_heads=4,
             num_key_value_heads=2,
         )
+
+@dataclass(frozen=True)
+class ParallelConfig:
+    tp: int = 1
+
+    def validate(self, model: ModelConfig) -> None:
+        # make sure the split actually works for the said model
+        for name, n in [("q heads", model.num_attention_heads),
+                        ("kv heads", model.num_key_value_heads),
+                        ("intermediate", model.intermediate_size),
+                        ("vocab", model.vocab_size)]:
+            if n % self.tp:
+                raise ValueError(f"{name}={n} not divisible by tp={self.tp}")

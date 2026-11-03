@@ -13,10 +13,11 @@ from inference_engine.models.decoder_layer import TransformerBlock
 class TransformerModel(nn.Module):
     """Complete Decoder-only Transformer Language Model."""
 
-    def __init__(self, config: ModelConfig, seed: int = 42):
+    def __init__(self, config: ModelConfig, rank: int = 0, parallelism: int = 1, seed: int = 42):
         super().__init__()
         torch.manual_seed(seed)
         self.config = config
+        self.rank, self.parallelism = rank, parallelism  # not used yet: every rank is full-size
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.rope = RotaryEmbedding(
             config.head_dim, config.max_position_embeddings, base=config.rope_theta
@@ -32,13 +33,15 @@ class TransformerModel(nn.Module):
         cls,
         model_name: str = DEFAULT_MODEL_NAME,
         dtype: torch.dtype = torch.float32,
+        rank: int = 0,
+        parallelism: int = 1,
     ) -> "TransformerModel":
         """
         Download raw pretrained weights from Hugging Face and load them directly
         into our custom TransformerModel layers.
         """
         config = ModelConfig.from_pretrained(model_name)
-        model = cls(config).to(dtype=dtype)
+        model = cls(config, rank, parallelism).to(dtype=dtype)
 
         hf_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype)
         hf_state_dict = hf_model.state_dict()
