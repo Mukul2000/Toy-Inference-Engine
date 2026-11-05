@@ -50,7 +50,7 @@ class Worker:
 def init_distributed(init_method: str, rank: int, tp: int) -> None:
     """Joins the gloo process group; returns once all tp ranks have joined."""
     dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=tp, timeout=TIMEOUT)
-    torch.set_num_threads(max(1, os.cpu_count() // tp))  # tp processes share the cores
+    torch.set_num_threads(max(1, (os.cpu_count() or 1) // tp))  # tp processes share the cores
 
 
 def worker_main(init_method: str, rank: int, tp: int, model_factory: ModelFactory) -> None:
@@ -58,8 +58,9 @@ def worker_main(init_method: str, rank: int, tp: int, model_factory: ModelFactor
     init_distributed(init_method, rank, tp)
     worker = Worker(model_factory.create_sliced_model(rank, tp), rank, tp)
     while True:
-        msg = [None]
+        msg: list[tuple[str, tuple] | None] = [None]  # filled in by rank 0's broadcast
         dist.broadcast_object_list(msg, src=0)
+        assert msg[0] is not None
         method, args = msg[0]
         if method == "stop":
             break

@@ -58,7 +58,7 @@ class Engine:
         batch = self.scheduler.schedule()
         if batch is None:
             return []
-        occupancy = {seq.slot: seq.seq_id for seq in self.scheduler.running.values()}
+        occupancy = {seq.slot: seq.seq_id for seq in self.scheduler.running.values() if seq.slot is not None}
         token_ids = self.executor.execute(batch)
         finished = self.scheduler.update(batch, token_ids, now=time.perf_counter())
         self.trace.append((batch, occupancy))
@@ -76,6 +76,8 @@ class Engine:
 
     @staticmethod
     def _output(seq: Sequence) -> RequestOutput:
+        # only called on finished sequences, which have both timestamps
+        assert seq.first_token_time is not None and seq.finish_time is not None
         return RequestOutput(
             token_ids=seq.output_ids,
             ttft_ms=(seq.first_token_time - seq.arrival_time) * 1000.0,

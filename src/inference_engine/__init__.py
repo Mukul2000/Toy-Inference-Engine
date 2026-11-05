@@ -1,7 +1,7 @@
 import time
 
 import torch
-from transformers import AutoTokenizer
+from transformers import AutoTokenizer, BatchEncoding, PreTrainedTokenizerBase
 
 from inference_engine.config import DEFAULT_MODEL_NAME
 from inference_engine.engine import BatchingPolicy, Engine
@@ -36,7 +36,7 @@ POLICIES = [
 ]
 
 
-def chat_prompt(tokenizer: AutoTokenizer, question: str) -> list[int]:
+def chat_prompt(tokenizer: PreTrainedTokenizerBase, question: str) -> list[int]:
     """
     Token ids of `question` in the model's chat format, ending with the assistant header
     (`add_generation_prompt=True`) so the model knows it is its turn to answer. Sent as raw
@@ -44,7 +44,9 @@ def chat_prompt(tokenizer: AutoTokenizer, question: str) -> list[int]:
     first token (an empty answer), or else keeps writing the user's text.
     """
     messages = [{"role": "user", "content": question}]
-    return tokenizer.apply_chat_template(messages, add_generation_prompt=True)["input_ids"]
+    encoded = tokenizer.apply_chat_template(messages, add_generation_prompt=True, return_dict=True)
+    assert isinstance(encoded, BatchEncoding)  # return_dict=True: a dict with "input_ids"
+    return encoded["input_ids"]
 
 
 def top2_gap(model: TransformerModel, token_ids: list[int]) -> float:
@@ -59,7 +61,7 @@ def first_mismatch(a: list[int], b: list[int]) -> int:
 
 
 def check_parity(
-    tokenizer: AutoTokenizer,
+    tokenizer: PreTrainedTokenizerBase,
     model: TransformerModel,
     requests: list[Request],
     results: list[tuple[str, list[RequestOutput]]],
@@ -135,6 +137,7 @@ def main() -> None:
     """Driver: serves the same requests under every batching policy and compares them."""
     print(f"Loading model & tokenizer: {DEFAULT_MODEL_NAME} ...")
     tokenizer = AutoTokenizer.from_pretrained(DEFAULT_MODEL_NAME)
+    assert tokenizer is not None
     executor = ModelExecutor.from_pretrained(DEFAULT_MODEL_NAME)
 
     requests = [Request(chat_prompt(tokenizer, q), MAX_NEW_TOKENS) for q in QUESTIONS]

@@ -24,8 +24,10 @@ def new_executor(model: TransformerModel, fill: str = "zeros") -> ModelExecutor:
     executor = ModelExecutor(ModelFactory(model.config))  # seeded: same weights as `model`
     executor.allocate_kv_cache(num_slots=4, max_seq_len=32)
     if fill == "random":  # stale data from imaginary previous owners
-        executor.kv_cache.k_cache.normal_()
-        executor.kv_cache.v_cache.normal_()
+        kv_cache = executor.kv_cache
+        assert kv_cache is not None  # allocated just above
+        kv_cache.k_cache.normal_()
+        kv_cache.v_cache.normal_()
     return executor
 
 
@@ -70,9 +72,9 @@ def test_a_rows_output_does_not_depend_on_its_slot_or_batchmates(model):
 @pytest.mark.parametrize("chunk", [1, 2, 4, 9])
 def test_chunked_prefill_matches_one_pass(model, chunk):
     executor = new_executor(model)
-    for start in range(0, len(B), chunk):  # B in chunks of `chunk` tokens, all in slot 3
-        logits = run_rows(executor, [(3, start, B[start : start + chunk])])
-    torch.testing.assert_close(logits[0], one_pass(model, B), atol=ATOL, rtol=0)
+    # B in chunks of `chunk` tokens, all in slot 3; the last chunk's logits predict B's next token
+    steps = [run_rows(executor, [(3, start, B[start : start + chunk])]) for start in range(0, len(B), chunk)]
+    torch.testing.assert_close(steps[-1][0], one_pass(model, B), atol=ATOL, rtol=0)
 
 
 def test_mixed_step_chunks_and_decodes(model):

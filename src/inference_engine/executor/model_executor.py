@@ -1,4 +1,5 @@
 import socket
+from multiprocessing.process import BaseProcess
 
 import torch
 import torch.distributed as dist
@@ -26,7 +27,7 @@ class ModelExecutor(Executor):
     def __init__(self, model_factory: ModelFactory, parallel_config: ParallelConfig = ParallelConfig()):
         self.tp = parallel_config.tp
         parallel_config.validate(model_factory.config)  # before any process or weight exists
-        self.procs: list[mp.Process] = []
+        self.procs: list[BaseProcess] = []
         if self.tp > 1:
             init_method = f"tcp://127.0.0.1:{free_port()}"
             ctx = mp.get_context("spawn")  # fresh interpreters: nothing shared but the args

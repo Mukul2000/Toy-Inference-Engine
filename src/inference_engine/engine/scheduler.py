@@ -56,6 +56,7 @@ class Scheduler:
 
         def take(seq: Sequence, limit: int) -> None:  # add one row, spend its tokens
             nonlocal budget
+            assert seq.slot is not None  # only running sequences are scheduled
             row = ScheduledSeq(seq.seq_id, seq.slot, seq.num_computed_tokens, seq.next_input(limit))
             rows.append(row)
             budget -= len(row.token_ids)
@@ -102,4 +103,5 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.finish_time = now
         del self.running[seq.seq_id]
+        assert seq.slot is not None  # a running sequence always owns a slot
         heapq.heappush(self.free_slots, seq.slot)
