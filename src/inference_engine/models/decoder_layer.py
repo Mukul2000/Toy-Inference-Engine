@@ -12,14 +12,14 @@ from inference_engine.models.mlp import SwiGLUMLP
 class TransformerBlock(nn.Module):
     """Single Decoder Transformer Layer (Pre-Norm architecture)."""
 
-    def __init__(self, layer_idx: int, config: ModelConfig):
+    def __init__(self, layer_idx: int, config: ModelConfig, rank: int = 0, tp: int = 1):
         super().__init__()
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.self_attn = Attention(layer_idx, config)
         self.post_attention_layernorm = nn.RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
-        self.mlp = SwiGLUMLP(config)
+        self.mlp = SwiGLUMLP(config, rank, tp)
 
     def forward(
         self,

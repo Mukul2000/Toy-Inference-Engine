@@ -18,13 +18,14 @@ class TransformerModel(nn.Module):
         super().__init__()
         torch.manual_seed(seed)
         self.config = config
+        self.tp = parallelism
         self.rank, self.parallelism = rank, parallelism  # not used yet: every rank is full-size
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, rank, parallelism) 
         self.rope = RotaryEmbedding(
             config.head_dim, config.max_position_embeddings, base=config.rope_theta
         )
         self.layers = nn.ModuleList(
-            [TransformerBlock(idx, config) for idx in range(config.num_hidden_layers)]
+            [TransformerBlock(idx, config, rank, parallelism) for idx in range(config.num_hidden_layers)]
         )
         self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
@@ -55,8 +56,19 @@ class TransformerModel(nn.Module):
                 "embed_tokens.weight"
             ]
         
+        # Keep only this rank's piece of each split weight (strict loading checks the shapes).
+        # nn.Linear stores weight as [out, in], so a column split of W [in, out] slices dim 0.
         step = config.vocab_size // parallelism
         mapped_state_dict["embed_tokens.weight"] = mapped_state_dict["embed_tokens.weight"][rank * step: (rank + 1) * step]
+
+        # MLP: rank r owns intermediate features lo..hi, in all three matrices
+        mlp_step = config.intermediate_size // parallelism
+        lo, hi = rank * mlp_step, (rank + 1) * mlp_step
+        for key, tensor in mapped_state_dict.items():
+            if key.endswith(("mlp.gate_proj.weight", "mlp.up_proj.weight")):  # [I, H]
+                mapped_state_dict[key] = tensor[lo:hi, :]                     # -> [I/tp, H]
+            elif key.endswith("mlp.down_proj.weight"):                         # [H, I]
+                mapped_state_dict[key] = tensor[:, lo:hi]                     # -> [H, I/tp]
         model.load_state_dict(mapped_state_dict, strict=True)
         model.eval()
         return model
