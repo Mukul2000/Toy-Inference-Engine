@@ -1,3 +1,4 @@
+from inference_engine.models.vocab_parallel_embedding import VocabParallelEmbedding
 from typing import Optional
 import torch
 import torch.nn as nn
@@ -18,7 +19,7 @@ class TransformerModel(nn.Module):
         torch.manual_seed(seed)
         self.config = config
         self.rank, self.parallelism = rank, parallelism  # not used yet: every rank is full-size
-        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size, rank, parallelism) 
         self.rope = RotaryEmbedding(
             config.head_dim, config.max_position_embeddings, base=config.rope_theta
         )
@@ -53,7 +54,9 @@ class TransformerModel(nn.Module):
             mapped_state_dict["lm_head.weight"] = mapped_state_dict[
                 "embed_tokens.weight"
             ]
-
+        
+        step = config.vocab_size // parallelism
+        mapped_state_dict["embed_tokens.weight"] = mapped_state_dict["embed_tokens.weight"][rank * step: (rank + 1) * step]
         model.load_state_dict(mapped_state_dict, strict=True)
         model.eval()
         return model

@@ -14,7 +14,6 @@ from inference_engine.models.transformer import TransformerModel
 # commands, so this also bounds how long the driver may stay idle (loading, printing, ...).
 TIMEOUT = datetime.timedelta(minutes=10)
 
-
 class Worker:
     """
     One rank: its model slice and its KV slot pool. Every rank runs the same Worker calls in
